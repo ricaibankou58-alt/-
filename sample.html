@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Horror Game</title>
+<style>
+  html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui, -apple-system, "Helvetica Neue", Arial;}
+  canvas{display:block;background:#0a0a0a; margin:0 auto; touch-action:none;}
+  #ui {
+    position:fixed; left:16px; top:16px; z-index:30; font-size:14px; color:#eee;
+    background: rgba(0,0,0,0.35); padding:8px 10px; border-radius:6px;
+  }
+  #title { font-weight:700; margin-bottom:6px; }
+  #startBtn { margin-top:8px; display:inline-block; padding:6px 8px; background:#2c2; color:#020; border-radius:6px; cursor:pointer; }
+  #hint { margin-top:6px; color:#ccc; font-size:13px; }
+  #overlayJump { position:fixed; inset:0; background:#000; display:flex; align-items:center; justify-content:center; z-index:100; opacity:0; pointer-events:none; }
+  #overlayJump img{ max-width:80%; transform:scale(1); }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div id="title">Mini Horror — Flashlight Demo</div>
+  <div>操作: マウス移動 = 視点、WASD = 少し移動</div>
+  <div id="hint">目的: 暗闇を避けつつ、先輩（敵）を観察して笑って帰る</div>
+  <div id="startBtn">Start (音あり)</div>
+</div>
+
+<div id="overlayJump"><img id="jumpImg" src="" alt="jump" /></div>
+
+<canvas id="screen"></canvas>
+
+<script>
+/*
+Mini Horror Game — single-file
+Features:
+- flashlight / darkness masking
+- simple roaming "entity" that moves in darkness
+- heartbeat and whisper audio via WebAudio API (no external files required)
+- jump-scare overlay
+- adjustable parameters in config
+*/
+
+// -------- CONFIG --------
+const CONFIG = {
+  width: 1280, height: 720, // canvas logical size (will scale to window)
+  flashlightRadius: 160,
+  darknessAlpha: 0.95,
+  entityCount: 1,
+  entitySpeed: 0.35, // pixels per ms approx
+  suspicionDistance: 90, // when close in dark -> triggers jump
+  whisperIntervalMin: 5000,
+  whisperIntervalMax: 14000,
+  heartbeatBase: 0.4, // base heartbeat rate multiplier
+  heartbeatMax: 1.6,  // when terrified
+  jumpSustainMs: 2000
+};
+
+// -------- SETUP CANVAS & SCALING --------
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const ratio = CONFIG.width / CONFIG.height;
+  let cw = w, ch = Math.round(w / ratio);
+  if (ch > h) { ch = h; cw = Math.round(h * ratio); }
+  canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+  canvas.width = CONFIG.width; canvas.height = CONFIG.height;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// -------- GAME STATE --------
+let gameStarted = false;
+let mouse = {x: CONFIG.width/2, y: CONFIG.height/2};
+let keys = {};
+let player = {x: CONFIG.width/2, y: CONFIG.height/2};
+let entities = [];
+let lastTime = performance.now();
+let audioCtx = null;
+let heartbeatGainNode = null;
+let heartbeatClock = 0;
+let fearLevel = 0; // 0..1
+let nextWhisper = Date.now() + 2000;
+let jumpActive = false;
+let jumpEnd = 0;
+
+// -------- BASIC AUDIO (WebAudio) --------
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // heartbeat oscillator (low thump)
+  heartbeatGainNode = audioCtx.createGain(); heartbeatGainNode.gain.value = 0;
+  const heartbeatOsc = audioCtx.createOscillator();
+  heartbeatOsc.type = 'sine'; heartbeatOsc.frequency.value = 60; // base, we'll trigger envelopes
+  const hbFilter = audioCtx.createBiquadFilter(); hbFilter.type = 'lowpass'; hbFilter.frequency.value = 200;
+  heartbeatOsc.connect(hbFilter); hbFilter.connect(heartbeatGainNode); heartbeatGainNode.connect(audioCtx.destination);
+  heartbeatOsc.start();
+
+  // background atmospheric noise via low-volume pink-ish noise
+  const bufferSize = 2 * audioCtx.sampleRate;
+  const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const output = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    output[i] = (Math.random()*2-1) * 0.02; // keep very low
+  }
+  const noiseNode = audioCtx.createBufferSource();
+  noiseNode.buffer = noiseBuffer; noiseNode.loop = true;
+  const noiseGain = audioCtx.createGain(); noiseGain.gain.value = 0.06;
+  noiseNode.connect(noiseGain); noiseGain.connect(audioCtx.destination);
+  noiseNode.start();
+}
+
+// heartbeat "thump" — schedule a quick envelope
+function heartbeatThump(intensity = 0.5) {
+  if (!audioCtx || !heartbeatGainNode) return;
+  const now = audioCtx.currentTime;
+  heartbeatGainNode.gain.cancelScheduledValues(now);
+  heartbeatGainNode.gain.setValueAtTime(0, now);
+  heartbeatGainNode.gain.linearRampToValueAtTime(0.2*intensity, now + 0.01);
+  heartbeatGainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.3 + 0.25*intensity);
+}
+
+// whisper (short tonal blip)
+function whisperBlip() {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  o.type = 'triangle'; o.frequency.value = 400 + Math.random()*600;
+  const g = audioCtx.createGain(); g.gain.value = 0;
+  const f = audioCtx.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 900;
+  o.connect(f); f.connect(g); g.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(0.06, now + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.00001, now + 0.6 + Math.random()*0.8);
+  o.start(); o.stop(now + 1.2);
+}
+
+// jump-scare loud noise (white noise burst)
+function jumpNoise() {
+  if (!audioCtx) return;
+  const bufferSize = audioCtx.sampleRate * 1;
+  const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random()*2-1) * (0.6 + Math.random()*0.6);
+  const src = audioCtx.createBufferSource(); src.buffer = noiseBuffer;
+  const g = audioCtx.createGain(); g.gain.value = 1.5;
+  const high = audioCtx.createBiquadFilter(); high.type = 'highpass'; high.frequency.value = 1200;
+  src.connect(g); g.connect(high); high.connect(audioCtx.destination);
+  src.start();
+}
+
+// -------- ENTITIES (enemy) --------
+function spawnEntities() {
+  entities = [];
+  for (let i=0;i<CONFIG.entityCount;i++){
+    // spawn near edges
+    const side = Math.floor(Math.random()*4);
+    let x = 0, y = 0;
+    if (side===0) { x = 20; y = Math.random()*CONFIG.height; }
+    if (side===1) { x = CONFIG.width-20; y = Math.random()*CONFIG.height; }
+    if (side===2) { y = 20; x = Math.random()*CONFIG.width; }
+    if (side===3) { y = CONFIG.height-20; x = Math.random()*CONFIG.width; }
+    entities.push({
+      x, y,
+      vx:0, vy:0,
+      state: 'idle', // idle / stalking / hunting
+      lastMove: performance.now() - Math.random()*4000
+    });
+  }
+}
+
+// entity behavior: in darkness they move toward player gently; in light they stall
+function updateEntities(dt) {
+  for (let e of entities){
+    const dx = player.x - e.x, dy = player.y - e.y;
+    const dist = Math.hypot(dx,dy);
+    // are they in light? if they are inside flashlight radius, slow/stop
+    const inLight = (dist < CONFIG.flashlightRadius*1.05);
+    if (!inLight) {
+      // move toward player slowly, but a bit jittery
+      const angle = Math.atan2(dy,dx) + (Math.random()-0.5)*0.6;
+      const sp = CONFIG.entitySpeed * (1 + Math.random()*0.4);
+      e.vx = Math.cos(angle)*sp;
+      e.vy = Math.sin(angle)*sp;
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      e.state = (dist < CONFIG.suspicionDistance*2) ? 'stalking' : 'idle';
+    } else {
+      // freeze, maybe turn away a little
+      e.x += (Math.random()-0.5) * 0.02 * dt;
+      e.y += (Math.random()-0.5) * 0.02 * dt;
+      if (dist < CONFIG.suspicionDistance && !inLight) {
+        e.state = 'hunting';
+      } else {
+        e.state = 'exposed';
+      }
+    }
+    // clamp inside
+    e.x = Math.max(8, Math.min(CONFIG.width-8, e.x));
+    e.y = Math.max(8, Math.min(CONFIG.height-8, e.y));
+  }
+}
+
+// detect jump conditions
+function checkJump(now) {
+  if (jumpActive) return;
+  for (let e of entities) {
+    const d = Math.hypot(player.x - e.x, player.y - e.y);
+    const inLight = (d < CONFIG.flashlightRadius);
+    // if entity close AND it's in darkness (i.e., outside flashlight) -> jump
+    if (d < CONFIG.suspicionDistance && !inLight) {
+      triggerJump(e);
+      break;
+    }
+  }
+}
+
+// trigger a jump-scare
+function triggerJump(entity) {
+  jumpActive = true;
+  jumpEnd = performance.now() + CONFIG.jumpSustainMs;
+  // visual: show overlay with random scary face drawn procedurally (or use placeholder)
+  const overlay = document.getElementById('overlayJump');
+  const img = document.getElementById('jumpImg');
+  img.src = ''; // keep blank — we'll draw via canvas snapshot below
+  overlay.style.background = 'rgba(0,0,0,0.98)';
+  overlay.style.pointerEvents = 'auto';
+  overlay.style.opacity = '1';
+  // audio
+  jumpNoise();
+  // change fear
+  fearLevel = 1.0;
+  // small shake: implement by adding a screen offset for a moment (handled in render)
+}
+
+// end jump
+function endJump() {
+  jumpActive = false;
+  const overlay = document.getElementById('overlayJump');
+  overlay.style.opacity = '0';
+  overlay.style.pointerEvents = 'none';
+  fearLevel = 0.0;
+}
+
+// -------- INPUT --------
+canvas.addEventListener('mousemove', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const sx = (e.clientX - rect.left) / (rect.width) * CONFIG.width;
+  const sy = (e.clientY - rect.top) / (rect.height) * CONFIG.height;
+  mouse.x = sx; mouse.y = sy;
+});
+window.addEventListener('keydown',(e)=>{ keys[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup',(e)=>{ keys[e.key.toLowerCase()] = false; });
+
+// simple player move
+function updatePlayer(dt) {
+  let speed = 0.12 * dt; // pixels per ms
+  if (keys['shift']) speed *= 1.6;
+  if (keys['w']||keys['arrowup']) player.y -= speed;
+  if (keys['s']||keys['arrowdown']) player.y += speed;
+  if (keys['a']||keys['arrowleft']) player.x -= speed;
+  if (keys['d']||keys['arrowright']) player.x += speed;
+  // clamp
+  player.x = Math.max(4, Math.min(CONFIG.width-4, player.x));
+  player.y = Math.max(4, Math.min(CONFIG.height-4, player.y));
+  // if no mouse movement, align flashlight to player facing
+  // (we prefer mouse control for precision)
+}
+
+// -------- VISUAL RENDER --------
+function renderScene() {
+  // clear
+  ctx.clearRect(0,0,CONFIG.width, CONFIG.height);
+  // background floor subtle
+  const grd = ctx.createLinearGradient(0,0,0,CONFIG.height);
+  grd.addColorStop(0,"#060606"); grd.addColorStop(1,"#0a0a0a");
+  ctx.fillStyle = grd; ctx.fillRect(0,0,CONFIG.width,CONFIG.height);
+
+  // draw some "room objects" for depth — random pillars/boxes
+  for (let i=0;i<6;i++){
+    const gx = ((i+1) * 137) % (CONFIG.width-120) + 40;
+    const gy = ((i+3) * 73) % (CONFIG.height-120) + 40;
+    ctx.fillStyle = "#111111";
+    ctx.fillRect(gx, gy, 86, 46);
+    ctx.fillStyle = "#141414";
+    ctx.fillRect(gx+6, gy+6, 74, 34);
+  }
+
+  // draw entities as dark silhouettes (if not in light)
+  for (let e of entities){
+    const d = Math.hypot(player.x - e.x, player.y - e.y);
+    const inLight = (d < CONFIG.flashlightRadius*1.05);
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    if (inLight) {
+      // partially visible: eerie pale silhouette
+      ctx.fillStyle = "rgba(240,240,240,0.14)";
+    } else {
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+    }
+    // draw a creepy hunched figure silhouette
+    ctx.beginPath();
+    ctx.ellipse(0,0,22,28,0,0,Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = inLight ? "rgba(200,20,10,0.9)" : "rgba(0,0,0,0.9)";
+    if (inLight) {
+      // visible eyes
+      ctx.fillRect(-6,-4,4,4); ctx.fillRect(6,-4,4,4);
+    }
+    ctx.restore();
+  }
+
+  // draw player marker (tiny)
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(player.x, player.y, 3,0,Math.PI*2); ctx.fill();
+
+  // darkness mask with radial light
+  // first, whole-screen dark rect
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,"+CONFIG.darknessAlpha+")";
+  ctx.fillRect(0,0,CONFIG.width,CONFIG.height);
+
+  // create circular hole for flashlight at mouse position (or player if prefer)
+  const fx = mouse.x, fy = mouse.y;
+  const radius = CONFIG.flashlightRadius * (1 + 0.6 * fearLevel);
+  const g = ctx.createRadialGradient(fx,fy, radius*0.2, fx,fy, radius);
+  g.addColorStop(0, "rgba(255,255,220,0.0)");
+  g.addColorStop(0.6, "rgba(255,255,180,0.05)");
+  g.addColorStop(1, "rgba(0,0,0,0.9)");
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(fx, fy, radius, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // draw subtle vignette / edge darkness
+  ctx.fillStyle = "rgba(0,0,0,0.15)"; ctx.fillRect(0,0,CONFIG.width,20); ctx.fillRect(0,CONFIG.height-20,CONFIG.width,20);
+
+  // HUD: tiny heart / fear meter
+  ctx.fillStyle = "#fff"; ctx.font = "18px Arial";
+  ctx.fillText("Fear: " + Math.round(fearLevel*100) + "%", 12, CONFIG.height - 12);
+}
+
+// small screen shake effect if jumpActive
+let shakeOffset = {x:0,y:0};
+function applyShake() {
+  if (jumpActive) {
+    const mag = 18 * (0.5 + Math.random()*0.7);
+    shakeOffset.x = (Math.random()*2-1) * mag;
+    shakeOffset.y = (Math.random()*2-1) * mag;
+  } else {
+    shakeOffset.x *= 0.8; shakeOffset.y *= 0.8;
+  }
+}
+
+// render wrapper with shake
+function render() {
+  applyShake();
+  ctx.save();
+  ctx.setTransform(1,0,0,1,shakeOffset.x,shakeOffset.y);
+  renderScene();
+  ctx.restore();
+}
+
+// -------- GAME LOOP --------
+function gameLoop(now) {
+  const dt = Math.min(40, now - lastTime); // ms, cap for stability
+  lastTime = now;
+  if (!gameStarted) { requestAnimationFrame(gameLoop); return; }
+
+  // inputs & updates
+  updatePlayer(dt);
+  updateEntities(dt);
+
+  // schedule whispers
+  if (Date.now() > nextWhisper) {
+    whisperBlip();
+    nextWhisper = Date.now() + CONFIG.whisperIntervalMin + Math.random()*(CONFIG.whisperIntervalMax - CONFIG.whisperIntervalMin);
+  }
+
+  // heartbeat: base rate modified by fear and proximity
+  // compute nearest entity distance not in light
+  let nearest = Infinity;
+  for (let e of entities) {
+    const d = Math.hypot(player.x - e.x, player.y - e.y);
+    if (d < nearest) nearest = d;
+  }
+  // map nearest to fearLevel smoothly
+  if (nearest < 400) {
+    const t = Math.max(0, (400 - nearest)/400);
+    fearLevel = Math.min(1, Math.max(fearLevel, t));
+  } else {
+    fearLevel *= 0.995; // fade
+  }
+
+  // heartbeat tempo increases with fearLevel
+  heartbeatClock += dt;
+  const interval = 800 - (fearLevel*(CONFIG.heartbeatMax*400)); // ms between thumps
+  if (heartbeatClock > interval) {
+    heartbeatClock = 0;
+    heartbeatThump(0.6 + fearLevel*1.6);
+  }
+
+  // check jump condition
+  checkJump(now);
+
+  // handle jump overlay timing
+  if (jumpActive && performance.now() > jumpEnd) endJump();
+
+  // render
+  render();
+
+  requestAnimationFrame(gameLoop);
+}
+
+// -------- START button and initialization --------
+document.getElementById('startBtn').addEventListener('click', async ()=>{
+  // start audio on user gesture
+  initAudio();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  // spawn entities and start
+  spawnEntities();
+  gameStarted = true;
+  document.getElementById('ui').style.display = 'none';
+  lastTime = performance.now();
+  requestAnimationFrame(gameLoop);
+});
+
+// safety: allow click on overlay to close jump early
+document.getElementById('overlayJump').addEventListener('click', ()=>{
+  if (jumpActive) endJump();
+});
+
+// small accessibility: tap to set mouse on mobile
+canvas.addEventListener('touchmove', (ev)=>{
+  const t = ev.touches[0];
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (t.clientX - rect.left) / (rect.width) * CONFIG.width;
+  mouse.y = (t.clientY - rect.top) / (rect.height) * CONFIG.height;
+  ev.preventDefault();
+}, {passive:false});
+canvas.addEventListener('touchstart', (ev)=>{
+  const t = ev.touches[0];
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (t.clientX - rect.left) / (rect.width) * CONFIG.width;
+  mouse.y = (t.clientY - rect.top) / (rect.height) * CONFIG.height;
+  ev.preventDefault();
+}, {passive:false});
+
+// initial draw
+render();
+</script>
+
+</body>
+</html>
